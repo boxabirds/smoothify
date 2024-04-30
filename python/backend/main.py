@@ -4,28 +4,74 @@ import requests
 import tensorflow as tf
 import tensorflow_hub as hub
 from typing import Generator, Iterable, List
-from mediapy import media
+import mediapy as media
+import glob
+import cv2
+import os
+import argparse
+from pathlib import Path
+import time
 
 # Inspired by https://www.tensorflow.org/hub/tutorials/tf_hub_film_example
 
 _UINT8_MAX_F = float(np.iinfo(np.uint8).max)
 
 
-def load_image(img_url: str):
-  print(f"load_image: {img_url}")
+def load_image(img_path: Path):
+  print(f"load_image: {img_path}")
   """Returns an image with shape [height, width, num_channels], with pixels in [0..1] range, and type np.float32."""
 
-  if (img_url.startswith("https")):
-    user_agent = {'User-agent': 'Colab Sample (https://tensorflow.org)'}
-    response = requests.get(img_url, headers=user_agent)
-    image_data = response.content
-  else:
-    image_data = tf.io.read_file(img_url)
-    #print(f"image_data for '{img_url}': {image_data}")
-
+  image_data = tf.io.read_file(str(img_path))
   image = tf.io.decode_image(image_data, channels=3)
   image_numpy = tf.cast(image, dtype=tf.float32).numpy()
   return image_numpy / _UINT8_MAX_F
+  #image = tf.io.decode_image(image_data, channels=3, expand_animations=False)
+  #return image.numpy()
+
+def extract_frames(movie_path: Path) -> tuple[Path, int, int]:
+    # Create the frames directory name
+    movie_name = movie_path.stem
+    frames_dir = Path(f"{movie_name}-frames")
+    
+    # Create the frames directory if it doesn't exist
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Open the video file
+    video = cv2.VideoCapture(str(movie_path))
+    
+    # Get the FPS of the video
+    fps = int(video.get(cv2.CAP_PROP_FPS))
+    
+    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    with tqdm(total=total_frames, desc="Extracting frames", unit="frame") as pbar:
+        frame_count = 0
+        while frame_count < total_frames:
+            # Generate the frame filename
+            frame_filename = frames_dir / f"frame_{frame_count:06d}.png"
+            
+            if not frame_filename.exists():
+                # Read the next frame
+                success, frame = video.read()
+                
+                if success:
+                    # Save the frame as a PNG image
+                    cv2.imwrite(str(frame_filename), frame)
+                else:
+                    print(f"Failed to read frame {frame_count}")
+            
+            # Increment the frame counter
+            frame_count += 1
+            
+            # Update the progress bar
+            pbar.update(1)
+    
+    # Release the video file
+    video.release()
+    
+    print(f"{movie_name} runs at {fps}: {frame_count} frames from {movie_path} into {frames_dir}")
+    return frames_dir, frame_count, fps
+
 
 
 def _pad_to_align(x, align):
@@ -80,6 +126,7 @@ class Interpolator:
     """
     self._model = hub.load("https://tfhub.dev/google/film/1")
     self._align = align
+    self.last_frame_time = -1
 
   def __call__(self, x0: np.ndarray, x1: np.ndarray,
                dt: np.ndarray) -> np.ndarray:
@@ -95,6 +142,7 @@ class Interpolator:
     Returns:
       The result with dimensions (batch_size, height, width, channels).
     """
+    start_time = time.time()
     if self._align is not None:
       x0, bbox_to_crop = _pad_to_align(x0, self._align)
       x1, _ = _pad_to_align(x1, self._align)
@@ -105,13 +153,15 @@ class Interpolator:
 
     if self._align is not None:
       image = tf.image.crop_to_bounding_box(image, **bbox_to_crop)
+    end_time = time.time()
+    self.last_frame_time = end_time - start_time
     return image.numpy()
   
 
 
 def _recursive_generator(
     frame1: np.ndarray, frame2: np.ndarray, num_recursions: int,
-    interpolator: Interpolator) -> Generator[np.ndarray, None, None]:
+    interpolator: Interpolator ) -> Generator[np.ndarray, None, None]:
   """Splits halfway to repeatedly generate more frames.
 
   Args:
@@ -140,9 +190,9 @@ def _recursive_generator(
 
 
 def interpolate_recursively(
-    frames: List[np.ndarray], num_recursions: int,
-    interpolator: Interpolator,
-    times_to_interpolate=3) -> Iterable[np.ndarray]:
+    frames: List[np.ndarray],
+    num_recursions: int,
+    interpolator: Interpolator) -> Iterable[np.ndarray]:
   """Generates interpolated frames by repeatedly interpolating the midpoint.
 
   Args:
@@ -156,21 +206,56 @@ def interpolate_recursively(
     The interpolated frames (including the inputs).
   """
   n = len(frames)
-  for i in tqdm(range(1, n), desc="Processing frames", unit="frames"):
+  for i in range(1, n):
       yield from _recursive_generator(frames[i - 1], frames[i],
-                                      times_to_interpolate, interpolator)
+                                      num_recursions, interpolator)
   # Separately yield the final frame.
   yield frames[-1]
 
 
 
-def generate_video(frames, recursion_depth, framedir):
-  interpolator = Interpolator()
-  frames = list(
-      interpolate_recursively(frames, recursion_depth, interpolator))
-  fps = 24
-  basic_movie_filename =  framedir + " " + str(fps) + ".mp4"
-  print(f'Creating {basic_movie_filename} with {len(frames)} frames')
-  media.write_video(basic_movie_filename, frames, fps=fps)
+def generate_video(frames, output_fps:int, output_path:Path, multiplier=2):
+    interpolator = Interpolator()
+    # assert that multiplier can only be 2 or 4
+    assert multiplier in [2, 4], f"multiplier must be 2 or 4, got {multiplier}"
 
-generate_video(input_frames, framedir)
+    # interpolation is done recursively. 
+    # 2x multiplier means 1 extra frame, recursion depth ONE
+    # 4x means 3 extra frames, recursion depth TWO. 
+    # TODO this is acceptable for 2 and 4 multipliers ONLY
+    num_recursions = multiplier // 2
+    with tqdm(total=len(frames)-1, desc="Processing frames", unit="frames") as pbar:
+      def update_progress(frame):
+          pbar.update(1)
+          pbar.set_postfix(frame_time=interpolator.last_frame_time)
+          return frame
+      
+      frames = map(update_progress, interpolate_recursively(frames, num_recursions, interpolator))
+      frames = list(frames)
+
+    print(f'Creating {output_path} with {len(frames)} frames at {output_fps} FPS')
+    media.write_video(output_path, frames, fps=output_fps)
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Video frame interpolation tool")
+    parser.add_argument("--source", required=True, help="Path to the input video file")
+    parser.add_argument("--fps-multiplier", type=int, choices=[2, 4], required=True, default=2, help="FPS multiplier (2 or 4)")
+    parser.add_argument("--dest", help="Path to the output video file (default: <source>-<fps>.mp4)")
+    args = parser.parse_args()
+
+    frames_dir, frame_count, fps = extract_frames(Path(args.source))
+    output_fps = fps * args.fps_multiplier
+
+    if args.dest:
+        output_path = Path(args.dest)
+    else:
+        source_name = Path(args.source).stem
+        output_path = Path(f"{source_name}-{output_fps}-fps.mp4")
+
+    filenames = sorted(frames_dir.glob("*.png"))
+    print(f"filenames: {filenames}")
+    input_frames = [load_image(image) for image in filenames]
+
+    generate_video(input_frames, output_fps, output_path, args.fps_multiplier)

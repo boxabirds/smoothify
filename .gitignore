@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 .DS_Store
 python/backend/**/*.png
+python/backend/test/large/
 
 
 # C extensions

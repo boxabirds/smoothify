@@ -1,3 +1,4 @@
+import subprocess
 from tqdm import tqdm
 import numpy as np
 import requests
@@ -12,19 +13,44 @@ import argparse
 from pathlib import Path
 import time
 
+print("cuDNN version:", tf.sysconfig.get_build_info()["cudnn_version"])
+print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+
+# we get CPU advanced instruction warnings if we don't do this but they're irrelevant for GPUs
+# "To enable the following instructions: AVX2 AVX_VNNI FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags."
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 # Inspired by https://www.tensorflow.org/hub/tutorials/tf_hub_film_example
 
 _UINT8_MAX_F = float(np.iinfo(np.uint8).max)
 
 
+def get_gpu_usage():
+    try:
+        output = subprocess.check_output(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total', '--format=csv,nounits,noheader'])
+        gpu_info = output.decode('utf-8').strip().split(',')
+        gpu_utilization = int(gpu_info[0])
+        gpu_memory_used = int(gpu_info[1])
+        gpu_memory_total = int(gpu_info[2])
+        gpu_memory_percentage = (gpu_memory_used / gpu_memory_total) * 100
+        return gpu_utilization, gpu_memory_used, gpu_memory_percentage
+    except subprocess.CalledProcessError as e:
+        print(f"Error retrieving GPU usage: {e}")
+        return None, None, None
+
+
+gpu_utilization_values = []
+gpu_memory_used_values = []
+gpu_memory_percentage_values = []
+
 def load_image(img_path: Path):
-  print(f"load_image: {img_path}")
   """Returns an image with shape [height, width, num_channels], with pixels in [0..1] range, and type np.float32."""
 
   image_data = tf.io.read_file(str(img_path))
   image = tf.io.decode_image(image_data, channels=3)
   image_numpy = tf.cast(image, dtype=tf.float32).numpy()
   return image_numpy / _UINT8_MAX_F
+  # TODO apparently this is a better approach
   #image = tf.io.decode_image(image_data, channels=3, expand_animations=False)
   #return image.numpy()
 
@@ -124,7 +150,27 @@ class Interpolator:
       align: 'If >1, pad the input size so it divides with this before
         inference.'
     """
-    self._model = hub.load("https://tfhub.dev/google/film/1")
+    model_url = "https://tfhub.dev/google/film/1"
+    start_time = time.time()
+    print(f"Loading model from {model_url}…")
+    self._model = hub.load(model_url)
+    end_time = time.time()
+    print(f"-- loaded model in {end_time - start_time:1f} seconds")
+
+    # Get the model's cache directory
+    # cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "tfhub_modules")
+
+    # # Determine the model file name
+    # model_name = model_url.split("/")[-1].replace("-", "_")
+
+    # # Construct the full path to the model directory
+    # model_dir = os.path.join(cache_dir, model_name)
+
+    # # Calculate the size of the model directory
+    # model_size = sum(os.path.getsize(os.path.join(model_dir, f)) for f in os.listdir(model_dir) if os.path.isfile(os.path.join(model_dir, f)))
+
+    # print(f"Model size: {model_size} bytes")
+
     self._align = align
     self.last_frame_time = -1
 
@@ -228,6 +274,12 @@ def generate_video(frames, output_fps:int, output_path:Path, multiplier=2):
       def update_progress(frame):
           pbar.update(1)
           pbar.set_postfix(frame_time=interpolator.last_frame_time)
+          gpu_utilization, gpu_memory_used, gpu_memory_percentage = get_gpu_usage()
+          if gpu_utilization is not None and gpu_memory_used is not None and gpu_memory_percentage is not None:
+              gpu_utilization_values.append(gpu_utilization)
+              gpu_memory_used_values.append(gpu_memory_used)
+              gpu_memory_percentage_values.append(gpu_memory_percentage)
+
           return frame
       
       frames = map(update_progress, interpolate_recursively(frames, num_recursions, interpolator))
@@ -241,21 +293,48 @@ def generate_video(frames, output_fps:int, output_path:Path, multiplier=2):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Video frame interpolation tool")
     parser.add_argument("--source", required=True, help="Path to the input video file")
-    parser.add_argument("--fps-multiplier", type=int, choices=[2, 4], required=True, default=2, help="FPS multiplier (2 or 4)")
-    parser.add_argument("--dest", help="Path to the output video file (default: <source>-<fps>.mp4)")
+    parser.add_argument("--multiplier", type=int, choices=[2, 4], default=2, help="Multiplier (2 or 4)")
+    parser.add_argument("--change", choices=["fps", "duration"], default="fps", help="Change 'fps' or 'duration' (default: fps)")
+    parser.add_argument("--dest", help="Path to the output video file (default: <source>-<fps/duration>.mp4)")
     args = parser.parse_args()
 
     frames_dir, frame_count, fps = extract_frames(Path(args.source))
-    output_fps = fps * args.fps_multiplier
+    output_fps = fps
+
+    if args.change == "fps":
+        output_fps *= args.multiplier
+    elif args.change == "duration":
+        output_fps = fps
 
     if args.dest:
         output_path = Path(args.dest)
     else:
         source_name = Path(args.source).stem
-        output_path = Path(f"{source_name}-{output_fps}-fps.mp4")
+        if args.change == "fps":
+            output_path = Path(f"{source_name}-{output_fps}-fps.mp4")
+        elif args.change == "duration":
+            output_duration = (frame_count / fps) * args.multiplier
+            output_path = Path(f"{source_name}-{output_duration:.2f}s.mp4")
 
     filenames = sorted(frames_dir.glob("*.png"))
-    print(f"filenames: {filenames}")
     input_frames = [load_image(image) for image in filenames]
 
-    generate_video(input_frames, output_fps, output_path, args.fps_multiplier)
+    generate_video(input_frames, output_fps, output_path, args.multiplier, args.change)
+    if len(gpu_utilization_values) > 0 and len(gpu_memory_used_values) > 0 and len(gpu_memory_percentage_values) > 0:
+        avg_gpu_utilization = sum(gpu_utilization_values) / len(gpu_utilization_values)
+        max_gpu_utilization = max(gpu_utilization_values)
+        min_gpu_utilization = min(gpu_utilization_values)
+        
+        avg_gpu_memory_used = sum(gpu_memory_used_values) / len(gpu_memory_used_values)
+        max_gpu_memory_used = max(gpu_memory_used_values)
+        min_gpu_memory_used = min(gpu_memory_used_values)
+        
+        avg_gpu_memory_percentage = sum(gpu_memory_percentage_values) / len(gpu_memory_percentage_values)
+        max_gpu_memory_percentage = max(gpu_memory_percentage_values)
+        min_gpu_memory_percentage = min(gpu_memory_percentage_values)
+        
+        print(f"\nGPU Utilization: Avg={avg_gpu_utilization:.2f}%, Max={max_gpu_utilization}%, Min={min_gpu_utilization}%")
+        print(f"GPU Memory Used: Avg={avg_gpu_memory_used:.2f}MB, Max={max_gpu_memory_used}MB, Min={min_gpu_memory_used}MB")
+        print(f"GPU Memory Usage: Avg={avg_gpu_memory_percentage:.2f}%, Max={max_gpu_memory_percentage:.2f}%, Min={min_gpu_memory_percentage:.2f}%")
+    else:
+        print("No GPU usage data collected.")

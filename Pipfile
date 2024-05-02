@@ -7,10 +7,10 @@ name = "pypi"
 tqdm = "*"
 numpy = "*"
 requests = "*"
-tensorflow = "*"
 tensorflow-hub = "*"
 mediapy = "*"
 opencv-python = "*"
+tensorflow = "*"
 
 [dev-packages]
 
